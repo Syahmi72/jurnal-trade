@@ -1,11 +1,4 @@
-"""MT5 -> Cloudflare journal sync, versi CI (GitHub Actions).
-
-Berbeda dari mt5_journal_push.py:
-  - tidak ada loop (runner hidup sebentar lalu mati)
-  - meluncurkan terminal lebih dulu dan menunggu IPC siap
-  - menunggu history selesai diunduh dari server broker
-  - exit code non-zero kalau upload gagal, supaya GitHub menandai run merah
-"""
+"""MT5 -> Cloudflare journal sync, versi CI (GitHub Actions)."""
 
 import argparse
 import csv
@@ -30,26 +23,29 @@ TOKEN = os.getenv("JOURNAL_TOKEN", "").strip()
 TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 
-def init_terminal():
-    """Luncurkan terminal dulu, lalu tunggu IPC-nya siap.
+def init_terminal(login, password, server):
+    """Luncurkan terminal dengan kredensial di command line.
 
-    Install MT5 yang masih baru menampilkan wizard 'Open an Account' saat
-    pertama dibuka, dan itu membuat initialize() kehabisan waktu.
+    Parameter /login /password /server membuat MT5 langsung masuk ke akun
+    dan melewati wizard 'Open an Account' yang memblokir initialize().
     """
     if os.path.exists(TERMINAL):
-        print("Meluncurkan terminal MT5...")
+        print("Meluncurkan terminal MT5 dengan kredensial...")
         try:
-            subprocess.Popen([TERMINAL])
+            subprocess.Popen([
+                TERMINAL,
+                f"/login:{login}",
+                f"/password:{password}",
+                f"/server:{server}",
+            ])
         except Exception as e:
             print(f"Gagal meluncurkan terminal: {e}")
-        time.sleep(45)
+        time.sleep(60)
 
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
-            if os.path.exists(TERMINAL):
-                ok = mt5.initialize(TERMINAL, timeout=180000)
-            else:
-                ok = mt5.initialize(timeout=180000)
+            ok = mt5.initialize(TERMINAL, timeout=120000) if os.path.exists(TERMINAL) \
+                 else mt5.initialize(timeout=120000)
         except Exception as e:
             print(f"initialize exception: {e}")
             ok = False
@@ -65,17 +61,21 @@ def init_terminal():
 
 
 def connect(login, password, server):
-    if not init_terminal():
+    if not init_terminal(login, password, server):
         sys.exit("Tidak bisa membuka terminal MT5.")
 
-    if not mt5.login(login, password=password, server=server):
-        err = mt5.last_error()
-        mt5.shutdown()
-        sys.exit(f"Login gagal: {err}")
-
     info = mt5.account_info()
+    if info is None:
+        if not mt5.login(login, password=password, server=server):
+            err = mt5.last_error()
+            mt5.shutdown()
+            sys.exit(f"Login gagal: {err}")
+        info = mt5.account_info()
+
     if info:
         print(f"Login OK: akun {info.login} @ {info.server}")
+    else:
+        print("Terminal terbuka tapi info akun belum tersedia, lanjut mencoba.")
 
 
 def build_rows(days):
@@ -127,7 +127,6 @@ def build_rows(days):
 
 
 def wait_for_history(days, tries=15, delay=12):
-    """Terminal baru butuh waktu mengunduh history dari server broker."""
     for i in range(1, tries + 1):
         rows = build_rows(days)
         if rows:
