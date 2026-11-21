@@ -14,6 +14,7 @@ import argparse
 import csv
 import glob
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -63,8 +64,20 @@ def kill_terminal():
     time.sleep(3)
 
 
+KEYS = ("authoriz", "login", "connect", "network", "fail", "invalid", "error",
+        "server", "account", "timeout", "denied")
+
+
+def read_log(path):
+    try:
+        with open(path, "r", encoding="utf-16", errors="replace") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+
 def show_diag(login, password):
-    """Cetak status proses dan potongan log MT5 (kredensial disensor)."""
+    """Cetak status proses dan log UTAMA terminal (login dan password disensor)."""
     try:
         r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq terminal64.exe"],
                            capture_output=True, text=True)
@@ -72,27 +85,33 @@ def show_diag(login, password):
     except Exception as e:
         print(f"Gagal cek proses: {e}")
 
-    roots = [os.path.join(os.environ.get("APPDATA", ""), "MetaQuotes", "Terminal")]
+    dirs = glob.glob(os.path.join(os.environ.get("APPDATA", ""), "MetaQuotes", "Terminal", "*"))
     if TERMINAL:
-        roots.append(os.path.dirname(TERMINAL))
+        dirs.append(os.path.dirname(TERMINAL))
 
-    logs = []
-    for root in roots:
-        if root and os.path.isdir(root):
-            logs += glob.glob(os.path.join(root, "**", "logs", "*.log"), recursive=True)
-    logs.sort(key=os.path.getmtime, reverse=True)
+    cands = []
+    for d in dirs:
+        cands += glob.glob(os.path.join(d, "logs", "*.log"))
+        cands += glob.glob(os.path.join(d, "MQL5", "Logs", "*.log"))
+    # hanya log harian (YYYYMMDD.log); abaikan metaeditor.log dan log Tester
+    main = [p for p in cands if re.fullmatch(r"\d{8}\.log", os.path.basename(p))]
+    main.sort(key=os.path.getmtime, reverse=True)
 
-    if not logs:
-        print("Tidak ada file log MT5 yang ditemukan.")
-    for path in logs[:2]:
-        try:
-            with open(path, "r", encoding="utf-16", errors="replace") as f:
-                lines = f.read().splitlines()[-25:]
-        except Exception as e:
-            print(f"Gagal baca log {os.path.basename(path)}: {e}")
-            continue
-        print(f"--- log: {os.path.basename(path)}")
-        for ln in lines:
+    if not main:
+        print("Log harian terminal tidak ditemukan.")
+        for p in cands[:5]:
+            print("  ada:", p)
+        return
+
+    for path in main[:2]:
+        lines = read_log(path)
+        print(f"--- log: {os.path.basename(os.path.dirname(path))}\\{os.path.basename(path)} ({len(lines)} baris)")
+        hits = [ln for ln in lines if any(k in ln.lower() for k in KEYS)]
+        print("[baris penting]")
+        for ln in hits[:40]:
+            print(mask(ln, login, password))
+        print("[25 baris terakhir]")
+        for ln in lines[-25:]:
             print(mask(ln, login, password))
 
 
