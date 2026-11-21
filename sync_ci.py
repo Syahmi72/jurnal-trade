@@ -1,12 +1,24 @@
-"""MT5 -> Cloudflare journal sync, versi CI (GitHub Actions)."""
+"""MT5 -> Cloudflare journal sync, versi CI (GitHub Actions).
+
+Perbaikan dari versi sebelumnya:
+- Tidak lagi meluncurkan terminal dengan /login /password /server (parameter itu
+  tidak resmi di MT5). Kredensial dikirim langsung ke mt5.initialize().
+- Terminal sisa proses sebelumnya dimatikan dulu sebelum tiap percobaan.
+- Percobaan ke-3: login lewat file config resmi (/config:file.ini).
+- Kalau gagal, script mencetak status proses terminal64 dan potongan log MT5
+  (login dan password disensor) supaya penyebabnya kelihatan.
+- Waktu trade dibaca sebagai UTC murni, tidak tergantung zona waktu runner.
+"""
 
 import argparse
 import csv
+import glob
 import os
 import subprocess
 import sys
+import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     import MetaTrader5 as mt5
@@ -20,43 +32,124 @@ FMT = "%Y-%m-%d %H:%M:%S"
 ENDPOINT = os.getenv("JOURNAL_ENDPOINT", "").strip()
 TOKEN = os.getenv("JOURNAL_TOKEN", "").strip()
 
-TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+
+def find_terminal():
+    """Cari terminal64.exe (bisa dioverride lewat env MT5_TERMINAL)."""
+    env = os.getenv("MT5_TERMINAL", "").strip()
+    if env and os.path.exists(env):
+        return env
+    bases = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]
+    for base in bases:
+        for path in glob.glob(os.path.join(base, "*MetaTrader*", "terminal64.exe")):
+            return path
+    return None
+
+
+TERMINAL = find_terminal()
+
+
+def mask(text, *secrets):
+    for s in secrets:
+        if s:
+            text = text.replace(str(s), "***")
+    return text
+
+
+def kill_terminal():
+    subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True)
+    time.sleep(3)
+
+
+def show_diag(login, password):
+    """Cetak status proses dan potongan log MT5 (kredensial disensor)."""
+    try:
+        r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq terminal64.exe"],
+                           capture_output=True, text=True)
+        print("Proses terminal64:", "ada" if "terminal64.exe" in r.stdout else "TIDAK ADA")
+    except Exception as e:
+        print(f"Gagal cek proses: {e}")
+
+    roots = [os.path.join(os.environ.get("APPDATA", ""), "MetaQuotes", "Terminal")]
+    if TERMINAL:
+        roots.append(os.path.dirname(TERMINAL))
+
+    logs = []
+    for root in roots:
+        if root and os.path.isdir(root):
+            logs += glob.glob(os.path.join(root, "**", "logs", "*.log"), recursive=True)
+    logs.sort(key=os.path.getmtime, reverse=True)
+
+    if not logs:
+        print("Tidak ada file log MT5 yang ditemukan.")
+    for path in logs[:2]:
+        try:
+            with open(path, "r", encoding="utf-16", errors="replace") as f:
+                lines = f.read().splitlines()[-25:]
+        except Exception as e:
+            print(f"Gagal baca log {os.path.basename(path)}: {e}")
+            continue
+        print(f"--- log: {os.path.basename(path)}")
+        for ln in lines:
+            print(mask(ln, login, password))
+
+
+def try_init(**kw):
+    try:
+        ok = mt5.initialize(**kw)
+    except Exception as e:
+        print(f"initialize exception: {e}")
+        return False
+    if not ok:
+        print(f"initialize gagal: {mt5.last_error()}")
+        mt5.shutdown()
+    return ok
 
 
 def init_terminal(login, password, server):
-    """Luncurkan terminal dengan kredensial di command line.
+    if not TERMINAL:
+        print("terminal64.exe tidak ditemukan. Cek step install MT5 di workflow.")
+        return False
+    print(f"Terminal: {TERMINAL}")
 
-    Parameter /login /password /server membuat MT5 langsung masuk ke akun
-    dan melewati wizard 'Open an Account' yang memblokir initialize().
-    """
-    if os.path.exists(TERMINAL):
-        print("Meluncurkan terminal MT5 dengan kredensial...")
-        try:
-            subprocess.Popen([
-                TERMINAL,
-                f"/login:{login}",
-                f"/password:{password}",
-                f"/server:{server}",
-            ])
-        except Exception as e:
-            print(f"Gagal meluncurkan terminal: {e}")
-        time.sleep(60)
-
-    for attempt in range(1, 3):
-        try:
-            ok = mt5.initialize(TERMINAL, timeout=120000) if os.path.exists(TERMINAL) \
-                 else mt5.initialize(timeout=120000)
-        except Exception as e:
-            print(f"initialize exception: {e}")
-            ok = False
-
-        if ok:
+    # Percobaan 1-2: kredensial langsung ke initialize()
+    for attempt in (1, 2):
+        kill_terminal()
+        print(f"Percobaan {attempt}: initialize dengan kredensial...")
+        if try_init(path=TERMINAL, login=login, password=password,
+                    server=server, timeout=120000):
             print(f"MT5 terinisialisasi (percobaan {attempt})")
             return True
+        time.sleep(15)
 
-        print(f"initialize gagal (percobaan {attempt}): {mt5.last_error()}")
-        time.sleep(20)
+    # Percobaan 3: login lewat file config resmi
+    print("Percobaan 3: luncurkan terminal lewat file config...")
+    kill_terminal()
+    cfg = os.path.join(tempfile.gettempdir(), "mt5_login.ini")
+    try:
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(
+                "[Common]\n"
+                f"Login={login}\n"
+                f"Password={password}\n"
+                f"Server={server}\n"
+                "KeepPrivate=1\n"
+                "NewsEnable=0\n"
+            )
+        subprocess.Popen([TERMINAL, f"/config:{cfg}"])
+        time.sleep(60)
+        if try_init(path=TERMINAL, timeout=120000):
+            print("MT5 terinisialisasi (percobaan 3, via config)")
+            return True
+    finally:
+        try:
+            os.remove(cfg)
+        except OSError:
+            pass
 
+    show_diag(login, password)
     return False
 
 
@@ -65,24 +158,31 @@ def connect(login, password, server):
         sys.exit("Tidak bisa membuka terminal MT5.")
 
     info = mt5.account_info()
-    if info is None:
+    if info is None or info.login != login:
         if not mt5.login(login, password=password, server=server):
             err = mt5.last_error()
+            show_diag(login, password)
             mt5.shutdown()
             sys.exit(f"Login gagal: {err}")
         info = mt5.account_info()
 
     if info:
-        print(f"Login OK: akun {info.login} @ {info.server}")
+        print(f"Login OK @ {info.server}")
     else:
         print("Terminal terbuka tapi info akun belum tersedia, lanjut mencoba.")
 
 
+def ts(t):
+    """Epoch dari MT5 -> string, dibaca sebagai UTC murni (= jam server broker)."""
+    return datetime.fromtimestamp(t, tz=timezone.utc).strftime(FMT)
+
+
 def build_rows(days):
-    start = datetime.now() - timedelta(days=days)
-    end = datetime.now() + timedelta(days=1)
+    end = datetime.now(timezone.utc) + timedelta(days=2)
+    start = datetime.now(timezone.utc) - timedelta(days=days)
     deals = mt5.history_deals_get(start, end)
     if deals is None:
+        print(f"history_deals_get gagal: {mt5.last_error()}")
         return []
 
     pos = {}
@@ -108,15 +208,16 @@ def build_rows(days):
 
         open_price = sum(d.price * d.volume for d in ins) / vin
         close_price = sum(d.price * d.volume for d in outs) / vout
-        profit = sum(d.profit + d.commission + d.swap + getattr(d, "fee", 0.0) for d in ins + outs)
+        profit = sum(d.profit + d.commission + d.swap + getattr(d, "fee", 0.0)
+                     for d in ins + outs)
 
         rows.append({
             "Position": pid,
             "Symbol": ins[0].symbol,
             "Type": "Buy" if ins[0].type == mt5.DEAL_TYPE_BUY else "Sell",
             "Lots": round(vin, 2),
-            "Opening time": datetime.fromtimestamp(min(d.time for d in ins)).strftime(FMT),
-            "Closing time": datetime.fromtimestamp(max(d.time for d in outs)).strftime(FMT),
+            "Opening time": ts(min(d.time for d in ins)),
+            "Closing time": ts(max(d.time for d in outs)),
             "Open price": round(open_price, 5),
             "Close price": round(close_price, 5),
             "Profit": round(profit, 2),
@@ -194,7 +295,7 @@ def main():
     try:
         account = int(login)
     except ValueError:
-        sys.exit(f"MT5_LOGIN harus berupa angka, isinya: {login!r}")
+        sys.exit("MT5_LOGIN harus berupa angka.")
 
     connect(account, password, server)
 
