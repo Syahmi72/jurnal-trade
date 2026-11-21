@@ -1,52 +1,51 @@
-name: Jurnal Sync
+name: Sync MT5 ke Cloudflare
 
 on:
+  workflow_dispatch:
   schedule:
-    # tiap 6 jam (UTC). GitHub bisa menunda beberapa menit saat ramai.
     - cron: "0 */6 * * *"
-  workflow_dispatch: {}
-
-concurrency:
-  group: jurnal-sync
-  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: windows-latest
     timeout-minutes: 30
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install MetaTrader 5
-        shell: pwsh
-        run: |
-          $url = "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
-          $exe = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
-          Write-Host "Mengunduh MT5..."
-          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-          Write-Host "Memasang MT5..."
-          Start-Process -FilePath $exe -ArgumentList "/auto" -Wait
-          Start-Sleep -Seconds 25
-          if (-not (Test-Path "C:\Program Files\MetaTrader 5\terminal64.exe")) {
-            Write-Host "terminal64.exe tidak ditemukan, isi folder:"
-            Get-ChildItem "C:\Program Files" -ErrorAction SilentlyContinue | Select-Object Name
-            exit 1
-          }
-          Write-Host "MT5 terpasang."
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install library
         run: pip install MetaTrader5
 
+      - name: Install MT5 Exness
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe" -OutFile exness5setup.exe -UserAgent "Mozilla/5.0"
+          Start-Process .\exness5setup.exe -ArgumentList "/auto" -Wait
+          Start-Sleep -Seconds 150
+          Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+          $t = Get-ChildItem "C:\Program Files" -Filter terminal64.exe -Recurse -Depth 2 | Select-Object -First 1
+          Write-Host "Terminal: $($t.FullName)"
+          "MT5_TERMINAL=$($t.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Sync history ke Cloudflare
+        run: python sync_ci.py --days 365 --tries 20
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
           MT5_SERVER: ${{ secrets.MT5_SERVER }}
           MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
           JOURNAL_ENDPOINT: ${{ secrets.JOURNAL_ENDPOINT }}
           JOURNAL_TOKEN: ${{ secrets.JOURNAL_TOKEN }}
-        run: python sync_ci.py --days 365
+
+      - name: Upload log terminal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-logs
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\MetaQuotes\Terminal\*\logs\*.log
+            C:\Program Files\MetaTrader*\logs\*.log
+          if-no-files-found: ignore
