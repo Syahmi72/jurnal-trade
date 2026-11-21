@@ -60,6 +60,9 @@ def mask(text, *secrets):
 
 
 def kill_terminal():
+    # Hanya di GitHub Actions. Di PC sendiri JANGAN matikan terminal yang sedang dipakai.
+    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
+        return
     subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True)
     time.sleep(3)
 
@@ -191,6 +194,19 @@ def connect(login, password, server):
         print("Terminal terbuka tapi info akun belum tersedia, lanjut mencoba.")
 
 
+def connect_attach():
+    """Mode attach: pakai terminal MT5 yang SUDAH terbuka dan login di PC ini."""
+    print("Mode attach: memakai terminal MT5 yang sudah login.")
+    kw = {"path": TERMINAL} if TERMINAL else {}
+    if not try_init(timeout=60000, **kw):
+        sys.exit("Tidak bisa terhubung. Pastikan MT5 sudah terbuka dan login.")
+    info = mt5.account_info()
+    if info is None:
+        mt5.shutdown()
+        sys.exit("Terminal terbuka tapi belum login ke akun.")
+    print(f"Terhubung @ {info.server}")
+
+
 def ts(t):
     """Epoch dari MT5 -> string, dibaca sebagai UTC murni (= jam server broker)."""
     return datetime.fromtimestamp(t, tz=timezone.utc).strftime(FMT)
@@ -283,6 +299,9 @@ def push():
         headers={
             "Authorization": f"Bearer {TOKEN}",
             "Content-Type": "text/csv; charset=utf-8",
+            # Cloudflare memblokir User-Agent bawaan Python-urllib (error 1010)
+            "User-Agent": "jurnal-sync/1.0 (MT5 history uploader)",
+            "Accept": "*/*",
         },
     )
 
@@ -302,21 +321,24 @@ def main():
     ap.add_argument("--delay", type=int, default=12)
     a = ap.parse_args()
 
-    login = os.getenv("MT5_LOGIN", "").strip()
-    server = os.getenv("MT5_SERVER", "").strip()
-    password = os.getenv("MT5_PASSWORD", "").strip()
+    if os.getenv("MT5_MODE", "").strip().lower() == "attach":
+        connect_attach()
+    else:
+        login = os.getenv("MT5_LOGIN", "").strip()
+        server = os.getenv("MT5_SERVER", "").strip()
+        password = os.getenv("MT5_PASSWORD", "").strip()
 
-    missing = [n for n, v in (("MT5_LOGIN", login), ("MT5_SERVER", server),
-                              ("MT5_PASSWORD", password)) if not v]
-    if missing:
-        sys.exit(f"Secret belum di-set: {', '.join(missing)}")
+        missing = [n for n, v in (("MT5_LOGIN", login), ("MT5_SERVER", server),
+                                  ("MT5_PASSWORD", password)) if not v]
+        if missing:
+            sys.exit(f"Secret belum di-set: {', '.join(missing)}")
 
-    try:
-        account = int(login)
-    except ValueError:
-        sys.exit("MT5_LOGIN harus berupa angka.")
+        try:
+            account = int(login)
+        except ValueError:
+            sys.exit("MT5_LOGIN harus berupa angka.")
 
-    connect(account, password, server)
+        connect(account, password, server)
 
     try:
         rows = wait_for_history(a.days, a.tries, a.delay)
