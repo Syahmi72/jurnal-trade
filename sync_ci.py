@@ -1,14 +1,4 @@
-"""MT5 -> Cloudflare journal sync, versi CI (GitHub Actions).
-
-Perbaikan dari versi sebelumnya:
-- Tidak lagi meluncurkan terminal dengan /login /password /server (parameter itu
-  tidak resmi di MT5). Kredensial dikirim langsung ke mt5.initialize().
-- Terminal sisa proses sebelumnya dimatikan dulu sebelum tiap percobaan.
-- Percobaan ke-3: login lewat file config resmi (/config:file.ini).
-- Kalau gagal, script mencetak status proses terminal64 dan potongan log MT5
-  (login dan password disensor) supaya penyebabnya kelihatan.
-- Waktu trade dibaca sebagai UTC murni, tidak tergantung zona waktu runner.
-"""
+"""MT5 -> Cloudflare journal sync (versi 3)."""
 
 import argparse
 import csv
@@ -35,7 +25,6 @@ TOKEN = os.getenv("JOURNAL_TOKEN", "").strip()
 
 
 def find_terminal():
-    """Cari terminal64.exe (bisa dioverride lewat env MT5_TERMINAL)."""
     env = os.getenv("MT5_TERMINAL", "").strip()
     if env and os.path.exists(env):
         return env
@@ -60,7 +49,7 @@ def mask(text, *secrets):
 
 
 def kill_terminal():
-    # Hanya di GitHub Actions. Di PC sendiri JANGAN matikan terminal yang sedang dipakai.
+    # Hanya di GitHub Actions. Di PC sendiri JANGAN matikan terminal yang dipakai.
     if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
         return
     subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True)
@@ -80,7 +69,6 @@ def read_log(path):
 
 
 def show_diag(login, password):
-    """Cetak status proses dan log UTAMA terminal (login dan password disensor)."""
     try:
         r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq terminal64.exe"],
                            capture_output=True, text=True)
@@ -96,7 +84,6 @@ def show_diag(login, password):
     for d in dirs:
         cands += glob.glob(os.path.join(d, "logs", "*.log"))
         cands += glob.glob(os.path.join(d, "MQL5", "Logs", "*.log"))
-    # hanya log harian (YYYYMMDD.log); abaikan metaeditor.log dan log Tester
     main = [p for p in cands if re.fullmatch(r"\d{8}\.log", os.path.basename(p))]
     main.sort(key=os.path.getmtime, reverse=True)
 
@@ -136,7 +123,6 @@ def init_terminal(login, password, server):
         return False
     print(f"Terminal: {TERMINAL}")
 
-    # Percobaan 1-2: kredensial langsung ke initialize()
     for attempt in (1, 2):
         kill_terminal()
         print(f"Percobaan {attempt}: initialize dengan kredensial...")
@@ -146,7 +132,6 @@ def init_terminal(login, password, server):
             return True
         time.sleep(15)
 
-    # Percobaan 3: login lewat file config resmi
     print("Percobaan 3: luncurkan terminal lewat file config...")
     kill_terminal()
     cfg = os.path.join(tempfile.gettempdir(), "mt5_login.ini")
@@ -204,11 +189,10 @@ def connect_attach():
     if info is None:
         mt5.shutdown()
         sys.exit("Terminal terbuka tapi belum login ke akun.")
-    print(f"Terhubung @ {info.server}")
+    print(f"Terhubung @ {info.server} (akun {info.login})")
 
 
 def ts(t):
-    """Epoch dari MT5 -> string, dibaca sebagai UTC murni (= jam server broker)."""
     return datetime.fromtimestamp(t, tz=timezone.utc).strftime(FMT)
 
 
@@ -300,7 +284,7 @@ def push():
             "Authorization": f"Bearer {TOKEN}",
             "Content-Type": "text/csv; charset=utf-8",
             # Cloudflare memblokir User-Agent bawaan Python-urllib (error 1010)
-            "User-Agent": "jurnal-sync/1.0 (MT5 history uploader)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JurnalSync/3.0",
             "Accept": "*/*",
         },
     )
@@ -315,6 +299,7 @@ def push():
 
 
 def main():
+    print("sync_ci versi 3 (User-Agent fix)")
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=365)
     ap.add_argument("--tries", type=int, default=15)
