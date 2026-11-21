@@ -2,13 +2,15 @@
 
 Berbeda dari mt5_journal_push.py:
   - tidak ada loop (runner hidup sebentar lalu mati)
-  - menunggu history selesai diunduh dari server broker sebelum menyerah
+  - meluncurkan terminal lebih dulu dan menunggu IPC siap
+  - menunggu history selesai diunduh dari server broker
   - exit code non-zero kalau upload gagal, supaya GitHub menandai run merah
 """
 
 import argparse
 import csv
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -25,30 +27,52 @@ FMT = "%Y-%m-%d %H:%M:%S"
 ENDPOINT = os.getenv("JOURNAL_ENDPOINT", "").strip()
 TOKEN = os.getenv("JOURNAL_TOKEN", "").strip()
 
-CANDIDATE_PATHS = [
-    None,
-    r"C:\Program Files\MetaTrader 5\terminal64.exe",
-    r"C:\Program Files\MetaTrader 5\terminal.exe",
-]
+TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 
 def init_terminal():
-    for path in CANDIDATE_PATHS:
-        ok = mt5.initialize(path) if path else mt5.initialize()
+    """Luncurkan terminal dulu, lalu tunggu IPC-nya siap.
+
+    Install MT5 yang masih baru menampilkan wizard 'Open an Account' saat
+    pertama dibuka, dan itu membuat initialize() kehabisan waktu.
+    """
+    if os.path.exists(TERMINAL):
+        print("Meluncurkan terminal MT5...")
+        try:
+            subprocess.Popen([TERMINAL])
+        except Exception as e:
+            print(f"Gagal meluncurkan terminal: {e}")
+        time.sleep(45)
+
+    for attempt in range(1, 4):
+        try:
+            if os.path.exists(TERMINAL):
+                ok = mt5.initialize(TERMINAL, timeout=180000)
+            else:
+                ok = mt5.initialize(timeout=180000)
+        except Exception as e:
+            print(f"initialize exception: {e}")
+            ok = False
+
         if ok:
-            print(f"MT5 terinisialisasi (path={path or 'default'})")
+            print(f"MT5 terinisialisasi (percobaan {attempt})")
             return True
-        print(f"initialize gagal untuk path={path or 'default'}: {mt5.last_error()}")
+
+        print(f"initialize gagal (percobaan {attempt}): {mt5.last_error()}")
+        time.sleep(20)
+
     return False
 
 
 def connect(login, password, server):
     if not init_terminal():
         sys.exit("Tidak bisa membuka terminal MT5.")
+
     if not mt5.login(login, password=password, server=server):
         err = mt5.last_error()
         mt5.shutdown()
         sys.exit(f"Login gagal: {err}")
+
     info = mt5.account_info()
     if info:
         print(f"Login OK: akun {info.login} @ {info.server}")
@@ -60,6 +84,7 @@ def build_rows(days):
     deals = mt5.history_deals_get(start, end)
     if deals is None:
         return []
+
     pos = {}
     for d in deals:
         if d.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
@@ -69,18 +94,22 @@ def build_rows(days):
             p["in"].append(d)
         elif d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY, mt5.DEAL_ENTRY_INOUT):
             p["out"].append(d)
+
     rows = []
     for pid, p in pos.items():
         if not p["in"] or not p["out"]:
             continue
+
         ins, outs = p["in"], p["out"]
         vin = sum(d.volume for d in ins)
         vout = sum(d.volume for d in outs)
         if vout < vin - 1e-9:
             continue
+
         open_price = sum(d.price * d.volume for d in ins) / vin
         close_price = sum(d.price * d.volume for d in outs) / vout
         profit = sum(d.profit + d.commission + d.swap + getattr(d, "fee", 0.0) for d in ins + outs)
+
         rows.append({
             "Position": pid,
             "Symbol": ins[0].symbol,
@@ -92,6 +121,7 @@ def build_rows(days):
             "Close price": round(close_price, 5),
             "Profit": round(profit, 2),
         })
+
     rows.sort(key=lambda r: r["Closing time"])
     return rows
 
@@ -136,6 +166,7 @@ def push():
             "Content-Type": "text/csv; charset=utf-8",
         },
     )
+
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return r.status, r.read().decode("utf-8", "replace").strip()
@@ -161,7 +192,13 @@ def main():
     if missing:
         sys.exit(f"Secret belum di-set: {', '.join(missing)}")
 
-    connect(int(login), password, server)
+    try:
+        account = int(login)
+    except ValueError:
+        sys.exit(f"MT5_LOGIN harus berupa angka, isinya: {login!r}")
+
+    connect(account, password, server)
+
     try:
         rows = wait_for_history(a.days, a.tries, a.delay)
         if not rows:
